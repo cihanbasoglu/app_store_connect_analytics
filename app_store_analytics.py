@@ -193,16 +193,20 @@ def download_segment(api_key, api_issuer_id, private_key_path, report_id):
         raise Exception(f"Error: {response.status_code} - {response.text}")
     
 # download the report via the download url from the previous step
-def extract_url_and_get_response(data, save_path):
-    # extract the url from the json response
-    url = data['data'][0]['attributes']['url']
+def extract_url_and_get_response(url, save_path):
+    # Extract the URL from the JSON response
     response = requests.get(url)
-
+    
+    # Check for a successful response
     if response.status_code == 200:
-        # decompress the gzip content
+        # Decompress the gzip content
         content_gzipped = BytesIO(response.content)
         content_decompressed = gzip.GzipFile(fileobj=content_gzipped).read().decode('utf-8')
+        
+        # Load the decompressed content into a DataFrame
         df = pd.read_csv(StringIO(content_decompressed), sep=',')
+        
+        # Save the DataFrame to the specified path
         df.to_csv(save_path, index=False)
         return save_path
     else:
@@ -211,41 +215,78 @@ def extract_url_and_get_response(data, save_path):
 
 # call all the functions to get the csv. change your save_path as desired.
 def get_reports(api_key, api_issuer_id, private_key_path, app_id, metric):
-    data1 = read_reports_app(api_key, api_issuer_id, private_key_path, app_id)
-    report_id_1 = data1['data'][0]['id']
-    data2 = read_reports(api_key, api_issuer_id, private_key_path, report_id_1, metric)
-    report_id_2 = data2['data'][0]['id']
-    data3 = get_instance(api_key, api_issuer_id, private_key_path, report_id_2)
-    report_id_3 = data3['data'][0]['id']
-    data4 = download_segment(api_key, api_issuer_id, private_key_path, report_id_3)
-    save_path = f"{metric}_{ds}_{app_id}.csv"
-    save_path = extract_url_and_get_response(data4, save_path)
-    return save_path
+    ds = datetime.today().strftime('%Y-%m-%d')
+    data2 = read_reports_app(api_key, api_issuer_id, private_key_path, app_id)
+    report_id_1 = data2['data'][0]['id']
+    data3 = read_reports(api_key, api_issuer_id, private_key_path, report_id_1, metric)
+    report_id_2 = []
+    for item in data3["data"]:
+        if item["attributes"]["name"] in ["App Downloads Standard", "App Store Discovery and Engagement Standard", "App Store Installation and Deletion Standard"]:
+            report_id_2.append(item["id"])
+    data4 = []
+    for id in report_id_2:
+        data4.append(get_instance(api_key, api_issuer_id, private_key_path, id))
+    report_id_3 = [item['id'] for entry in data4 for item in entry['data'] if 'id' in item]
+    data5 = []
+    for id in report_id_3:
+        data5.append(download_segment(api_key, api_issuer_id, private_key_path, id))
+    urls = []
+    for report in data5:
+        if 'data' in report:
+            for item in report['data']:
+                if 'attributes' in item and 'url' in item['attributes']:
+                    urls.append(item['attributes']['url'])
+    save_paths = []
+    loop_count = 0
+    for url in urls:
+        i = loop_count
+        save_path = f"{metric}_{ds}_{app_id}_{i}.csv"
+        save_paths.append(extract_url_and_get_response(url, save_path))
+        loop_count += 1
+    return save_paths
 
-# get app store analytics file for each metric. remember, it takes 1-2 days for your report to be ready before you can download it.
-# possible values as a metric are APP_USAGE, APP_STORE_ENGAGEMENT, COMMERCE, FRAMEWORK_USAGE, PERFORMANCE
-metric_list = ["APP_STORE_ENGAGEMENT", "APP_USAGE", "COMMERCE", "FRAMEWORK_USAGE", "PERFORMANCE"]
+# get app store analytics file for each metric
+# Possible Values: APP_USAGE, APP_STORE_ENGAGEMENT, COMMERCE, FRAMEWORK_USAGE, PERFORMANCE
+metric_list = ["APP_STORE_ENGAGEMENT", "APP_USAGE", "COMMERCE"]
+errors = []
+
 for metric in metric_list:
     for app_id in app_list:
-        try:
-            print(f"Downloading {app_id}")
-            save_path = get_reports(api_key, api_issuer_id, private_key_path, app_id, metric)
-            # check if the file exists before attempting to read it
-            if os.path.exists(save_path):
-                df = pd.read_csv(save_path, sep='\t')
-                if df is not None:
-                    rev_col = []
-                    for col in df.columns:
-                        rev_col.append(convert_to_snake_case(col))
-                else:
-                    break
-                df.columns = rev_col
-                df['app_id'] = app_id
-                df['app_id'] = 'id' + df['app_id'].astype(str)
+        attempt_count = 0
+        max_attempts = 5  # Set a max attempt count to avoid infinite loops
+        while attempt_count < max_attempts:
+            try:
+                print(f"Downloading {app_id}")
+                save_paths = get_reports(api_key, api_issuer_id, private_key_path, app_id, metric)
+                # check if the file exists before attempting to read it
+                for save_path in save_paths:
+                    if os.path.exists(save_path):
+                        with open(save_path, 'r') as file:
+                            df = pd.read_csv(file, sep='\t')
+                        if not df.empty:
+                            rev_col = [convert_to_snake_case(col) for col in df.columns]
+                            df.columns = rev_col
+                            df.insert(1, "platform", "IOS")
+                            df['app_id'] = 'id' + str(app_id)
+                            df = df.astype(str)
+                            UPLOAD_TO_YOUR_DATABASE(df, project, dataset, table, credentials, 'append')
+                            del df
+                            os.remove(save_path)
+                            time.sleep(5)
+                        else:
+                            print(f"Empty file found for {app_id}. Skipping...")
+                    else:
+                        print(f"No file found for {app_id}")
+                break  # Success, exit the loop
+            except Exception as e:
+                attempt_count += 1
                 time.sleep(5)
-            else:
-                print(f"No file found for {app_id}")
-        
-        except Exception as e:
-            print(f"Error processing {app_id}: {str(e)}")
-            continue
+                print(f'Attempt {attempt_count}: {e}. Retrying...')
+                if attempt_count == max_attempts:
+                    errors.append((app_id, str(e)))
+        else:
+            print(f"Failed to process {app_id} after {max_attempts} attempts.")
+
+if errors:
+    error_messages = [f"{app_id}: {error}" for app_id, error in errors]
+    raise Exception("Errors occurred while downloading files:\n" + "\n".join(error_messages))
